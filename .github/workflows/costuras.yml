@@ -1,0 +1,51 @@
+name: costuras
+# Realza ventanas cifradas en paralelo (release «costuras»); la salida viaja cifrada.
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  realzar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        grupo: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Datos
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLAVE: ${{ secrets.CLAVE }}
+        run: |
+          gh release download costuras -R "$GITHUB_REPOSITORY" -p costuras.enc
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:CLAVE -in costuras.enc | tar -xf -
+          rm costuras.enc
+          mkdir -p entrada salida
+          for k in $(( ${{ matrix.grupo }}*3+1 )) $(( ${{ matrix.grupo }}*3+2 )) $(( ${{ matrix.grupo }}*3+3 )); do
+            f=v/costura_$(printf %02d $k).wav; [ -f $f ] && mv $f entrada/
+          done
+          echo "ventanas: $(ls entrada | wc -l)"
+      - name: Entorno
+        run: |
+          pip install -q uv
+          uv venv -q -p 3.11 venv
+          VIRTUAL_ENV=$PWD/venv uv pip install -q --index-strategy unsafe-best-match -r requirements-voz.txt
+      - name: Realzar
+        run: |
+          venv/bin/python -u realzar.py entrada salida 2>&1 | grep --line-buffered -E "paso (8|16|24|32)/32|Error|error|Traceback" || true
+          echo "realzadas: $(ls salida | wc -l) de $(ls entrada | wc -l)"
+          [ "$(ls salida | wc -l)" = "$(ls entrada | wc -l)" ]
+      - name: Cifrar
+        env:
+          CLAVE: ${{ secrets.CLAVE }}
+        run: tar -cf - salida | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:CLAVE -out costuras_${{ matrix.grupo }}.enc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: costuras-${{ matrix.grupo }}
+          path: costuras_${{ matrix.grupo }}.enc
+          retention-days: 2
