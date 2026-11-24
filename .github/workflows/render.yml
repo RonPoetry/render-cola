@@ -1,0 +1,220 @@
+name: render
+# Render cifrado: los datos llegan cifrados (release «datos») y todo lo que sale de una máquina viaja cifrado.
+on:
+  workflow_dispatch:
+    inputs:
+      partes:
+        description: "Partes de video en paralelo"
+        default: "16"
+
+permissions:
+  contents: write
+
+env:
+  CUADROS: "28692"
+  ESCALA: "0.6666666666666666"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matriz: ${{ steps.m.outputs.matriz }}
+    steps:
+      - id: m
+        run: |
+          n=${{ inputs.partes }}; t=$CUADROS
+          python3 -c "
+          import json; n=$n; t=$t; s=-(-t//n)
+          print('matriz='+json.dumps({'include':[{'i':i,'a':i*s,'b':min(t,(i+1)*s)-1} for i in range(n) if i*s<t]}))" >> "$GITHUB_OUTPUT"
+
+  voz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        parte: ["09", "12", "32"]
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Datos
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLAVE: ${{ secrets.CLAVE }}
+        run: |
+          gh release download datos -R "$GITHUB_REPOSITORY" -p paquete.enc
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:CLAVE -in paquete.enc | tar -xf - video/tools/voz "voz/trozos/parte_${{ matrix.parte }}.wav"
+          rm paquete.enc
+      - name: Entorno
+        run: |
+          pip install -q uv
+          uv venv -q -p 3.11 venv
+          VIRTUAL_ENV=$PWD/venv uv pip install -q --index-strategy unsafe-best-match -r video/tools/voz/requirements-voz.txt
+      - name: Realzar
+        run: |
+          mkdir -p entrada salida
+          cp voz/trozos/parte_${{ matrix.parte }}.wav entrada/
+          cd video && ../venv/bin/python -u tools/voz/realzar.py ../entrada ../salida 2>&1 | grep -E "paso (8|16|24|32)/32|Error|error" || true
+          ls -la ../salida
+      - name: Cifrar
+        env:
+          CLAVE: ${{ secrets.CLAVE }}
+        run: |
+          test -s salida/parte_${{ matrix.parte }}.wav
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:CLAVE -in salida/parte_${{ matrix.parte }}.wav -out voz_${{ matrix.parte }}.enc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voz-${{ matrix.parte }}
+          path: voz_${{ matrix.parte }}.enc
+          retention-days: 2
+
+  video:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matriz) }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Datos
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLAVE: ${{ secrets.CLAVE }}
+        run: |
+          gh release download datos -R "$GITHUB_REPOSITORY" -p paquete.enc
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:CLAVE -in paquete.enc | tar -xf - video
+          rm paquete.enc
+      - uses: actions/cache@v4
+        with:
+          path: video/node_modules
+          key: nm-${{ hashFiles('video/package-lock.json') }}
+      - name: Dependencias
+        working-directory: video
+        run: |
+          [ -d node_modules/remotion ] || npm ci --no-audit --no-fund --silent
+          npx remotion browser ensure --log=error > /dev/null
+      - name: Render cuadros ${{ matrix.a }}-${{ matrix.b }}
+        working-directory: video
+        run: |
+          inicio=$(date +%s)
+          npx remotion render src/index.ts Silent ../parte.mp4 --frames=${{ matrix.a }}-${{ matrix.b }} --scale=$ESCALA --crf=18 --concurrency=100% --log=error
+          n=$(ffprobe -v error -count_packets -select_streams v:0 -show_entries stream=nb_read_packets -of csv=p=0 ../parte.mp4 2>/dev/null || echo "?")
+          echo "parte ${{ matrix.i }}: $n cuadros (esperados $(( ${{ matrix.b }} - ${{ matrix.a }} + 1 ))) en $(( $(date +%s) - inicio )) s"
+      - name: Cifrar
+        env:
+          CLAVE: ${{ secrets.CLAVE }}
+        run: openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:CLAVE -in parte.mp4 -out video_${{ matrix.i }}.enc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: video-${{ matrix.i }}
+          path: video_${{ matrix.i }}.enc
+          retention-days: 2
+
+  sonido:
+    needs: voz
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: ffmpeg
+        run: |
+          timeout 300 sudo apt-get update -qq && timeout 300 sudo apt-get install -y -qq ffmpeg > /dev/null || {
+            curl -sSL https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz | tar -xJ
+            sudo cp ffmpeg-*-static/ffmpeg ffmpeg-*-static/ffprobe /usr/local/bin/; }
+          ffmpeg -version | head -1
+      - name: Datos
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLAVE: ${{ secrets.CLAVE }}
+        run: |
+          gh release download datos -R "$GITHUB_REPOSITORY" -p paquete.enc
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:CLAVE -in paquete.enc | tar -xf -
+          rm paquete.enc
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: voz-*
+          path: vozart
+          merge-multiple: true
+      - name: Unir y pulir la voz
+        env:
+          CLAVE: ${{ secrets.CLAVE }}
+        run: |
+          pip install -q numpy
+          mkdir -p partes
+          for i in $(seq 0 39); do id=$(printf %02d $i)
+            if [ -s voz/realzada/parte_$id.flac ]; then src=voz/realzada/parte_$id.flac
+            else openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:CLAVE -in vozart/voz_$id.enc -out tmp_$id.wav; src=tmp_$id.wav; fi
+            ffmpeg -v error -y -i $src -ar 44100 -ac 1 -c:a pcm_s24le partes/parte_$id.wav
+          done
+          ls partes | wc -l
+          for f in partes/*.wav; do echo "file '$PWD/$f'"; done > lista.txt
+          ffmpeg -v error -y -f concat -safe 0 -i lista.txt -c copy voz_realzada.wav
+          echo "voz unida: $(ffprobe -v error -show_entries format=duration -of csv=p=0 voz_realzada.wav) s"
+          cd video && mkdir -p public/audio && python3 tools/voz/voice_polish.py ../voz_realzada.wav public/audio/voz.wav > /dev/null
+          ffmpeg -v info -i public/audio/voz.wav -af ebur128=peak=true -f null - 2>&1 | grep -E "^\s+(I|Peak):"
+      - name: Música
+        working-directory: video
+        run: python3 tools/musica_v5.py audio-fuente/musica-v5 | tail -2
+      - uses: actions/cache@v4
+        with:
+          path: video/node_modules
+          key: nm-${{ hashFiles('video/package-lock.json') }}
+      - name: Sonido completo
+        working-directory: video
+        run: |
+          [ -d node_modules/remotion ] || npm ci --no-audit --no-fund --silent
+          npx remotion browser ensure --log=error > /dev/null
+          inicio=$(date +%s)
+          npx remotion render src/index.ts SoloAudio ../mezcla.wav --codec=wav --concurrency=100% --log=error
+          echo "sonido: $(ffprobe -v error -show_entries format=duration -of csv=p=0 ../mezcla.wav) s en $(( $(date +%s) - inicio )) s"
+          cd .. && ffmpeg -v error -y -i mezcla.wav -af "loudnorm=I=-16:TP=-1.5:LRA=9,alimiter=limit=0.80:level=false" -ar 48000 mezcla_final.wav
+          ffmpeg -v info -i mezcla_final.wav -af ebur128=peak=true -f null - 2>&1 | grep -E "^\s+(I|Peak):"
+      - name: Cifrar
+        env:
+          CLAVE: ${{ secrets.CLAVE }}
+        run: |
+          ffmpeg -v error -y -i video/public/audio/voz.wav -c:a flac voz.flac
+          tar -cf - mezcla_final.wav voz.flac | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:CLAVE -out sonido.enc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sonido
+          path: sonido.enc
+          retention-days: 2
+
+  unir:
+    needs: [video, sonido]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: ffmpeg
+        run: |
+          timeout 300 sudo apt-get update -qq && timeout 300 sudo apt-get install -y -qq ffmpeg > /dev/null || {
+            curl -sSL https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz | tar -xJ
+            sudo cp ffmpeg-*-static/ffmpeg ffmpeg-*-static/ffprobe /usr/local/bin/; }
+      - uses: actions/download-artifact@v4
+        with:
+          path: art
+          merge-multiple: true
+      - name: Unir y mezclar
+        env:
+          CLAVE: ${{ secrets.CLAVE }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          d() { openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:CLAVE -in "$1" -out "$2"; }
+          n=$(ls art/video_*.enc | wc -l)
+          for i in $(seq 0 $((n-1))); do d art/video_$i.enc v_$i.mp4; echo "file '$PWD/v_$i.mp4'"; done > lista.txt
+          ffmpeg -v error -y -f concat -safe 0 -i lista.txt -c copy mudo.mp4
+          c=$(ffprobe -v error -count_packets -select_streams v:0 -show_entries stream=nb_read_packets -of csv=p=0 mudo.mp4)
+          echo "video unido: $c cuadros (esperados $CUADROS)"; [ "$c" = "$CUADROS" ]
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:CLAVE -in art/sonido.enc | tar -xf -
+          ffmpeg -v error -y -i mudo.mp4 -i mezcla_final.wav -map 0:v -map 1:a -c:v copy -c:a aac -b:a 256k -shortest final.mp4
+          echo "final: $(ffprobe -v error -show_entries format=duration -of csv=p=0 final.mp4) s, $(du -h final.mp4 | cut -f1)"
+          tar -cf - final.mp4 voz.flac | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:CLAVE -out salida.enc
+          gh release delete salida -R "$GITHUB_REPOSITORY" -y 2>/dev/null || true
+          gh release create salida -R "$GITHUB_REPOSITORY" --title salida --notes "" salida.enc
