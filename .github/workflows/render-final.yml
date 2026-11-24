@@ -43,9 +43,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           CLAVE: ${{ secrets.CLAVE }}
         run: |
-          gh release download datos2 -R "$GITHUB_REPOSITORY" -p paquete.enc
-          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:CLAVE -in paquete.enc | tar -xf - video
-          rm paquete.enc
+          gh release download datos2 -R "$GITHUB_REPOSITORY" -p paquete2.enc
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:CLAVE -in paquete2.enc | tar -xf - video
+          rm paquete2.enc
       - uses: actions/cache@v4
         with:
           path: video/node_modules
@@ -89,9 +89,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           CLAVE: ${{ secrets.CLAVE }}
         run: |
-          gh release download datos2 -R "$GITHUB_REPOSITORY" -p paquete.enc
-          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:CLAVE -in paquete.enc | tar -xf -
-          rm paquete.enc
+          gh release download datos2 -R "$GITHUB_REPOSITORY" -p paquete2.enc
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:CLAVE -in paquete2.enc | tar -xf -
+          rm paquete2.enc
           cd video/public/audio && ffmpeg -v error -y -i voz.flac voz.wav && ffmpeg -v error -y -i music.flac music.wav && rm voz.flac music.flac && ls -la
       - uses: actions/cache@v4
         with:
